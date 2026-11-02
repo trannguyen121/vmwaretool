@@ -180,3 +180,40 @@ def validate_gui_cleanup(
         reasons=reasons,
         warnings=["Cleanup thật dùng UI Automation tuần tự qua VMware Workstation"],
     )
+
+
+def validate_force_compact(
+    vm: VirtualMachine,
+    environment: VMwareEnvironment,
+    running_vms: set[str] | None = None,
+) -> ValidationResult:
+    """Minimum invariants for an explicitly authorized destructive test.
+
+    Snapshot, linked-clone and lock checks are intentionally warnings here. The
+    function never deletes or modifies those metadata files.
+    """
+    reasons: list[str] = []
+    warnings: list[str] = []
+    if not environment.cleanup_available:
+        reasons.append("Không tìm thấy vmware-vdiskmanager.exe")
+    if not vm.vmx_path.is_file():
+        reasons.append("Không tìm thấy file VMX")
+    if running_vms is None:
+        reasons.append("Không xác minh được trạng thái Powered Off")
+    elif _norm(vm.vmx_path) in running_vms:
+        reasons.append("VM đang hoạt động")
+    if not vm.vmdks:
+        reasons.append("VMX không tham chiếu VMDK đang hoạt động nào")
+    missing = [p.name for p in vm.vmdks if not p.is_file()]
+    if missing:
+        reasons.append("Thiếu VMDK descriptor: " + ", ".join(missing))
+    readonly = [p.name for p in vm.vmdks if p.exists() and not _is_writable(p)]
+    if readonly:
+        reasons.append("Không có quyền đọc/ghi VMDK: " + ", ".join(readonly))
+    if _has_snapshots(vm):
+        warnings.append("FORCE bỏ qua snapshot")
+    if _is_linked(vm):
+        warnings.append("FORCE bỏ qua linked clone/parent dependency")
+    if _has_locks(vm):
+        warnings.append("FORCE bỏ qua .lck (không xóa lock)")
+    return ValidationResult(safe=not reasons, reasons=reasons, warnings=warnings)

@@ -55,5 +55,7 @@ class CleanupResult:
     vm: VirtualMachine
     status: CleanupStatus
     message: str
+    before_bytes: int = 0
+    after_bytes: int = 0
     reclaimed_bytes: int = 0
 

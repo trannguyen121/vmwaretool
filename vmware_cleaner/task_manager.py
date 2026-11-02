@@ -26,12 +26,15 @@ class ConcurrentTaskManager:
     def __init__(self, engine: CleanupEngine, callbacks: TaskCallbacks) -> None:
         self.engine = engine
         self.callbacks = callbacks
-        self._lock = threading.Lock()
+        # A Future can finish before add_done_callback() is called. In that
+        # case concurrent.futures invokes _completed synchronously on the
+        # caller (the Qt UI thread), while start() still owns this lock.
+        # RLock prevents that immediate-completion path from deadlocking the UI.
+        self._lock = threading.RLock()
         self._executor: ThreadPoolExecutor | None = None
         self._pending: list[VirtualMachine] = []
         self._active: dict[Future[CleanupResult], VirtualMachine] = {}
         self._active_chains: set[str] = set()
-        self._active_volumes: set[str] = set()
         self._stopping = False
         self._mode: Mode = "scan"
         self._max_workers = 1
@@ -66,7 +69,7 @@ class ConcurrentTaskManager:
 
     def _resources_free(self, vm: VirtualMachine) -> bool:
         chain = {str(p).casefold() for p in vm.chain_files}
-        return not (chain & self._active_chains or vm.volume_ids & self._active_volumes)
+        return not (chain & self._active_chains)
 
     def _schedule_locked(self) -> None:
         if self._stopping or not self._executor:
@@ -77,7 +80,6 @@ class ConcurrentTaskManager:
                 break
             vm = self._pending.pop(index)
             self._active_chains.update(str(p).casefold() for p in vm.chain_files)
-            self._active_volumes.update(vm.volume_ids)
             self.callbacks.status(vm, CleanupStatus.RUNNING, "")
             future = self._executor.submit(getattr(self.engine, self._mode), vm)
             self._active[future] = vm
@@ -87,7 +89,6 @@ class ConcurrentTaskManager:
         with self._lock:
             vm = self._active.pop(future)
             self._active_chains.difference_update(str(p).casefold() for p in vm.chain_files)
-            self._active_volumes.difference_update(vm.volume_ids)
         try:
             result = future.result()
         except Exception as exc:  # defensive boundary around worker threads

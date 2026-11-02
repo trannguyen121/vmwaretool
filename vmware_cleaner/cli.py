@@ -29,7 +29,7 @@ def main() -> int:
         else:
             result = CleanupResult(
                 vm, CleanupStatus.DONE,
-                "DryRun: VMware UI > VM > Manage > Clean Up Disks > Clean up now",
+                "DryRun: VMware > VM > Manage > Clean Up Disks > Clean up now",
             )
         results.append(
             {
@@ -47,7 +47,7 @@ def main() -> int:
         json.dumps(
             {
                 "vmware_version": environment.version,
-                "cleanup_backend": "VMware Workstation UI Automation (serial)",
+                "cleanup_backend": "VMware Workstation Clean Up Disks via UI Automation",
                 "inventory": str(environment.inventory_path or ""),
                 "mode": args.mode,
                 "vm_count": len(vms),

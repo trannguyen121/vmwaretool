@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import logging
+import subprocess
 import time
 
 from .models import CleanupResult, CleanupStatus, VirtualMachine, VMwareEnvironment
 
 LOG = logging.getLogger(__name__)
-FAST_POLL = 0.05
-COMPLETION_POLL = 0.10
+# VMware 16 exposes native/UIA state quickly. Short polling keeps the menu and
+# confirmation sequence responsive without shortening disk-write timeouts.
+FAST_POLL = 0.02
+COMPLETION_POLL = 0.05
+RETRY_DELAY = 0.05
 
 
 class UIAutomationError(RuntimeError):
@@ -21,37 +25,64 @@ class VMwareUIAutomation:
         self.environment = environment
 
     def cleanup(self, vm: VirtualMachine) -> CleanupResult:
+        before = self._disk_bytes(vm)
         try:
             reclaimed = self._run_cleanup(vm)
+            after = self._disk_bytes(vm)
             message = "VMware Clean Up Disks hoàn tất"
             if reclaimed:
                 message += f"; reclaimable trước khi chạy: {reclaimed}"
-            return CleanupResult(vm, CleanupStatus.DONE, message)
+            return CleanupResult(
+                vm, CleanupStatus.DONE, message,
+                before_bytes=before, after_bytes=after,
+                reclaimed_bytes=max(0, before - after),
+            )
         except UIAutomationError as exc:
             LOG.error("UI Automation failed for %s: %s", vm.name, exc)
-            return CleanupResult(vm, CleanupStatus.FAILED, str(exc))
+            after = self._disk_bytes(vm)
+            return CleanupResult(
+                vm, CleanupStatus.FAILED, str(exc),
+                before_bytes=before, after_bytes=after,
+                reclaimed_bytes=max(0, before - after),
+            )
         except Exception as exc:
             LOG.exception("Unexpected UI Automation error for %s", vm.name)
-            return CleanupResult(vm, CleanupStatus.FAILED, f"UI Automation lỗi: {exc}")
+            after = self._disk_bytes(vm)
+            return CleanupResult(
+                vm, CleanupStatus.FAILED, f"UI Automation lỗi: {exc}",
+                before_bytes=before, after_bytes=after,
+                reclaimed_bytes=max(0, before - after),
+            )
+
+    @staticmethod
+    def _disk_bytes(vm: VirtualMachine) -> int:
+        total = 0
+        for path in vm.chain_files:
+            try:
+                total += path.stat().st_size
+            except OSError:
+                pass
+        return total
 
     def _run_cleanup(self, vm: VirtualMachine) -> str:
         try:
             import pythoncom
-            from pywinauto import Desktop
+            from pywinauto import Desktop, timings
         except ImportError as exc:
             raise UIAutomationError("Thiếu pywinauto/pywin32; hãy cài lại requirements.txt") from exc
 
         pythoncom.CoInitialize()
         window_state = None
         try:
+            timings.Timings.window_find_retry = FAST_POLL
+            timings.Timings.exists_retry = FAST_POLL
             desktop = Desktop(backend="uia")
-            main = self._find_workstation_window(desktop, vm.name)
-            window_state = self._move_workstation_offscreen(main)
+            main = self._find_or_open_workstation_window(desktop, vm)
+            window_state = self._show_workstation_for_cleanup(main)
 
             dialog = self._open_cleanup_dialog_with_retry(
                 desktop, main, vm.name, window_state[1]
             )
-            self._restore_foreground(window_state[1])
             reclaimable = self._reclaimable_text(dialog)
             button = dialog.child_window(title="Clean up now", control_type="Button")
             if not button.exists(timeout=5):
@@ -74,7 +105,6 @@ class VMwareUIAutomation:
             reclaimable = self._reclaimable_text(dialog) or reclaimable
 
             self._click_native_button(button, "Clean up now")
-            self._restore_foreground(window_state[1])
             LOG.info("Clicked VMware Clean up now for %s", vm.name)
             self._wait_for_completion(
                 main, dialog, button, reclaimable, window_state[1]
@@ -95,6 +125,27 @@ class VMwareUIAutomation:
         if not candidates:
             raise UIAutomationError("Hãy mở VMware Workstation trước khi Cleanup")
         raise UIAutomationError(f"VM {vm_name} không có trong cửa sổ VMware Workstation")
+
+    def _find_or_open_workstation_window(self, desktop, vm: VirtualMachine):
+        try:
+            return self._find_workstation_window(desktop, vm.name)
+        except UIAutomationError:
+            if not self.environment.vmware_exe:
+                raise UIAutomationError("Không tìm thấy vmware.exe để mở VMware Workstation")
+        try:
+            subprocess.Popen([str(self.environment.vmware_exe), str(vm.vmx_path)])
+        except OSError as exc:
+            raise UIAutomationError(f"Không mở được VMware Workstation: {exc}") from exc
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            time.sleep(0.25)
+            try:
+                return self._find_workstation_window(desktop, vm.name)
+            except UIAutomationError:
+                continue
+        raise UIAutomationError(
+            f"Đã mở VMware nhưng không tìm thấy tab/Library item của {vm.name} sau 30 giây"
+        )
 
     @staticmethod
     def _open_vm_menu_without_input(main) -> None:
@@ -165,58 +216,37 @@ class VMwareUIAutomation:
                     "Disk Cleanup navigation attempt %d/8 failed for %s: %s",
                     attempt, vm_name, exc,
                 )
-                self._restore_foreground(foreground_handle)
-                time.sleep(0.15)
+                time.sleep(RETRY_DELAY)
         raise UIAutomationError(
             "Không mở được Disk Cleanup sau 8 lần thử; "
             f"thao tác người dùng có thể đang đóng menu VMware ({last_error})"
         )
 
     @staticmethod
-    def _move_workstation_offscreen(main):
-        """Keep VMware on a secondary monitor, or park it offscreen on a single display."""
+    def _show_workstation_for_cleanup(main):
+        """Restore and foreground VMware so the normal cleanup flow stays visible."""
         try:
-            import win32api
             import win32con
             import win32gui
 
             handle = main.handle
             placement = win32gui.GetWindowPlacement(handle)
             foreground = win32gui.GetForegroundWindow()
-            monitor = win32api.MonitorFromWindow(
-                handle, win32con.MONITOR_DEFAULTTONEAREST
-            )
-            monitor_info = win32api.GetMonitorInfo(monitor)
-            is_primary = bool(
-                monitor_info.get("Flags", 0) & win32con.MONITORINFOF_PRIMARY
-            )
-
-            # When the user has placed Workstation on a physical secondary
-            # monitor, leave it there. Native popup menus then stay on that
-            # monitor instead of Windows clamping offscreen menus to primary.
-            if not is_primary:
-                VMwareUIAutomation._restore_foreground(foreground)
-                LOG.info("Keeping VMware on its physical secondary monitor")
-                return placement, foreground
-
-            left, top, right, bottom = win32gui.GetWindowRect(handle)
-            width, height = max(1, right - left), max(1, bottom - top)
-            show_command = placement[1]
-            if show_command in {win32con.SW_SHOWMINIMIZED, win32con.SW_SHOWMAXIMIZED}:
+            if placement[1] == win32con.SW_SHOWMINIMIZED:
                 win32gui.ShowWindow(handle, win32con.SW_RESTORE)
-            win32gui.SetWindowPos(
-                handle,
-                win32con.HWND_BOTTOM,
-                -20000,
-                -20000,
-                width,
-                height,
-                win32con.SWP_NOACTIVATE | win32con.SWP_NOOWNERZORDER,
-            )
-            VMwareUIAutomation._restore_foreground(foreground)
+            else:
+                win32gui.ShowWindow(handle, win32con.SW_SHOW)
+            try:
+                win32gui.SetForegroundWindow(handle)
+            except Exception:
+                pass
+            LOG.info("Showing VMware Workstation for visible Clean Up Disks automation")
             return placement, foreground
         except Exception as exc:
-            raise UIAutomationError(f"Không thể chuẩn bị VMware chạy nền: {exc}") from exc
+            raise UIAutomationError(f"Không thể hiển thị VMware Workstation: {exc}") from exc
+
+    # Compatibility alias retained for code that referenced the previous name.
+    _move_workstation_offscreen = _show_workstation_for_cleanup
 
     @staticmethod
     def _restore_foreground(handle: int | None) -> None:
@@ -297,9 +327,7 @@ class VMwareUIAutomation:
         unchanged_enabled_since = time.monotonic()
         while time.monotonic() < deadline:
             time.sleep(COMPLETION_POLL)
-            self._restore_foreground(foreground_handle)
             if self._acknowledge_finished_dialog(main):
-                self._restore_foreground(foreground_handle)
                 self._close_finished_cleanup_dialog(dialog)
                 return
             if not dialog.exists(timeout=0.1):
@@ -384,7 +412,7 @@ class VMwareUIAutomation:
     @staticmethod
     def _close_finished_cleanup_dialog(dialog) -> None:
         """Close the underlying Disk Cleanup window after acknowledging completion."""
-        deadline = time.monotonic() + 0.5
+        deadline = time.monotonic() + 0.12
         while time.monotonic() < deadline:
             if not dialog.exists(timeout=0.1):
                 return
@@ -397,7 +425,7 @@ class VMwareUIAutomation:
             ]
             if buttons:
                 buttons[0].invoke()
-                close_deadline = time.monotonic() + 2
+                close_deadline = time.monotonic() + 1
                 while time.monotonic() < close_deadline and dialog.exists(timeout=0.1):
                     time.sleep(FAST_POLL)
         except Exception:

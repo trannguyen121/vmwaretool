@@ -1,0 +1,1 @@
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\Users\Admin\Downloads\PowerOff-All-VMware.ps1"

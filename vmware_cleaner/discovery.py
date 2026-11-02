@@ -5,7 +5,7 @@ import os
 import re
 from pathlib import Path
 
-from .models import VMwareEnvironment, VirtualMachine
+from .models import CleanupStatus, VMwareEnvironment, VirtualMachine
 
 LOG = logging.getLogger(__name__)
 ASSIGNMENT = re.compile(r'^\s*([^#=]+?)\s*=\s*"(.*)"\s*$')
@@ -135,6 +135,14 @@ def discover_vms(environment: VMwareEnvironment) -> list[VirtualMachine]:
         seen.add(key)
         if not vmx.is_file():
             LOG.warning("VMX in inventory does not exist: %s", vmx)
+            result.append(
+                VirtualMachine(
+                    name=name or vmx.stem,
+                    vmx_path=vmx.resolve(strict=False),
+                    status=CleanupStatus.SKIPPED,
+                    status_detail="Không tìm thấy file VMX; có thể xóa hiển thị khỏi Library.",
+                )
+            )
             continue
         try:
             result.append(vm_from_vmx(vmx, name))

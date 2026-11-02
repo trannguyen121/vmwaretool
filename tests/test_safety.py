@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from vmware_cleaner.models import VMwareEnvironment
-from vmware_cleaner.safety import validate_gui_cleanup, validate_vm
+from vmware_cleaner.safety import validate_force_compact, validate_gui_cleanup, validate_vm
 from vmware_cleaner.discovery import vm_from_vmx
 
 
@@ -52,3 +52,16 @@ def test_gui_cleanup_allows_linked_clone_and_vmware_lock(tmp_path: Path) -> None
         vm, VMwareEnvironment(vmware_exe=vmware), running_vms=set()
     )
     assert result.safe
+
+
+def test_force_compact_warns_but_allows_linked_clone_and_lock(tmp_path: Path) -> None:
+    vm = make_vm(tmp_path, 'createType="monolithicSparse"\nparentFileNameHint="parent.vmdk"\n')
+    (tmp_path / "safe.vmx.lck").mkdir()
+    cli = tmp_path / "vmware-vdiskmanager.exe"
+    cli.write_bytes(b"fake")
+    result = validate_force_compact(
+        vm, VMwareEnvironment(vdiskmanager_exe=cli), running_vms=set()
+    )
+    assert result.safe
+    assert any("linked clone" in warning for warning in result.warnings)
+    assert any(".lck" in warning for warning in result.warnings)

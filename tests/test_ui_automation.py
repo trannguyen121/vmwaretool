@@ -1,4 +1,7 @@
 from vmware_cleaner.ui_automation import VMwareUIAutomation
+from pathlib import Path
+
+from vmware_cleaner.models import VirtualMachine, VMwareEnvironment
 
 
 class FakeControl:
@@ -75,3 +78,42 @@ def test_native_workstation_completion_uses_bm_click(monkeypatch) -> None:
 
     assert VMwareUIAutomation._acknowledge_finished_dialog(main)
     assert sent and sent[0][0] == 102
+
+
+def test_disk_bytes_measures_entire_chain(tmp_path) -> None:
+    descriptor = tmp_path / "disk.vmdk"
+    extent = tmp_path / "disk-s001.vmdk"
+    descriptor.write_bytes(b"d" * 100)
+    extent.write_bytes(b"e" * 900)
+    vmx = tmp_path / "demo.vmx"
+    vmx.write_text("", encoding="utf-8")
+    vm = VirtualMachine(
+        name="Demo", vmx_path=vmx,
+        chain_files=frozenset({descriptor, extent}),
+    )
+    assert VMwareUIAutomation._disk_bytes(vm) == 1000
+
+
+def test_opens_workstation_when_vm_is_not_visible(monkeypatch, tmp_path) -> None:
+    vmware = tmp_path / "vmware.exe"
+    vmware.write_bytes(b"")
+    vmx = tmp_path / "Demo.vmx"
+    vmx.write_text('displayName = "Demo"\n', encoding="utf-8")
+    vm = VirtualMachine("Demo", vmx)
+    automation = VMwareUIAutomation(VMwareEnvironment(vmware_exe=vmware))
+    attempts = iter([RuntimeError("missing"), "window"])
+    launches = []
+
+    def find(_desktop, _name):
+        result = next(attempts)
+        if isinstance(result, Exception):
+            from vmware_cleaner.ui_automation import UIAutomationError
+            raise UIAutomationError(str(result))
+        return result
+
+    monkeypatch.setattr(automation, "_find_workstation_window", find)
+    monkeypatch.setattr("vmware_cleaner.ui_automation.subprocess.Popen", lambda args: launches.append(args))
+    monkeypatch.setattr("vmware_cleaner.ui_automation.time.sleep", lambda _seconds: None)
+
+    assert automation._find_or_open_workstation_window(object(), vm) == "window"
+    assert launches == [[str(vmware), str(vmx)]]

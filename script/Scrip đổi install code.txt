@@ -1,0 +1,3 @@
+Scrip đổi install code
+
+C:\Windows\System32\Sysprep\Sysprep.exe
